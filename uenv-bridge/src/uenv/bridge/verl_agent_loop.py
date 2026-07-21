@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from typing import Any
 from .agent_loop_clients import build_agent_loop_episode_client
 from .clients import EpisodeClient
 from .model_gateway import ModelGateway, ModelGatewayConfig, normalize_openai_endpoint
+from . import obs_client
 from .protocol import EpisodeRequest, EpisodeResult, MODE_MULTI, ResourceSpec, request_to_jsonable
 from .utils import prompt_text, to_jsonable
 
@@ -158,6 +160,7 @@ class UEnvAgentLoopConfig:
     model_gateway_port: int = 18080
     model_gateway_public_url: str = ""
     model_gateway_log_path: str = ""
+    model_gateway_disable_thinking: bool = False
     parallel_mode: str = "sync"
 
 
@@ -200,6 +203,7 @@ class UEnvAgentLoop(AgentLoopBase):
         model_gateway_port: int | None = None,
         model_gateway_public_url: str = "",
         model_gateway_log_path: str = "",
+        model_gateway_disable_thinking: bool | None = None,
         parallel_mode: str = "sync",
         **kwargs: Any,
     ) -> None:
@@ -230,6 +234,7 @@ class UEnvAgentLoop(AgentLoopBase):
             model_gateway_port=_int_value(model_gateway_port, 18080),
             model_gateway_public_url=_optional_string(model_gateway_public_url) or "",
             model_gateway_log_path=_optional_string(model_gateway_log_path) or "",
+            model_gateway_disable_thinking=_bool_value(model_gateway_disable_thinking, False),
             parallel_mode=_optional_string(parallel_mode) or "sync",
         )
         self.model_gateway = ModelGateway(
@@ -240,6 +245,7 @@ class UEnvAgentLoop(AgentLoopBase):
                 public_url=self.config_for_uenv.model_gateway_public_url,
                 request_timeout_seconds=self.config_for_uenv.timeout_seconds,
                 log_path=self.config_for_uenv.model_gateway_log_path,
+                disable_thinking=self.config_for_uenv.model_gateway_disable_thinking,
             )
         )
         self.client = client or build_agent_loop_episode_client(
@@ -329,12 +335,32 @@ class UEnvAgentLoop(AgentLoopBase):
         *,
         batch_id: str,
     ) -> list[AgentLoopOutput]:
-        requests = await self._build_batch_requests(sampling_params_by_sample, sample_kwargs_by_sample, batch_id=batch_id)
-        outputs: list[AgentLoopOutput] = []
-        for chunk in self._request_chunks(requests):
-            chunk_results = await self._submit_episode_chunk_with_retry(chunk)
-            outputs.extend([self._output_from_result(request, result) for request, result in zip(chunk, chunk_results, strict=True)])
-        return outputs
+        training_run_id = str(
+            os.environ.get("UENV_TRAINING_RUN_ID")
+            or batch_id
+            or f"verl-{uuid.uuid4().hex[:8]}"
+        )
+        obs_client.run_started(training_run_id, correlation_id=f"batch:{batch_id}")
+        try:
+            requests = await self._build_batch_requests(
+                sampling_params_by_sample,
+                sample_kwargs_by_sample,
+                batch_id=batch_id,
+                training_run_id=training_run_id,
+            )
+            outputs: list[AgentLoopOutput] = []
+            for chunk in self._request_chunks(requests):
+                chunk_results = await self._submit_episode_chunk_with_retry(chunk)
+                outputs.extend(
+                    [
+                        self._output_from_result(request, result)
+                        for request, result in zip(chunk, chunk_results, strict=True)
+                    ]
+                )
+            return outputs
+        finally:
+            obs_client.run_stopped(training_run_id, correlation_id=f"batch:{batch_id}")
+            obs_client.run_closed(training_run_id, correlation_id=f"batch:{batch_id}")
 
     async def _build_batch_requests(
         self,
@@ -342,6 +368,7 @@ class UEnvAgentLoop(AgentLoopBase):
         sample_kwargs_by_sample: list[dict[str, Any]],
         *,
         batch_id: str,
+        training_run_id: str,
     ) -> list[EpisodeRequest]:
         runtime_model = await self._runtime_model_endpoint(
             sampling_params_by_sample[0] if sampling_params_by_sample else {},
@@ -351,7 +378,12 @@ class UEnvAgentLoop(AgentLoopBase):
         for sample_index, (sampling_params, sample_kwargs) in enumerate(
             zip(sampling_params_by_sample, sample_kwargs_by_sample, strict=True)
         ):
-            sample_kwargs = self._sample_kwargs_with_batch_index(sample_kwargs, batch_id=batch_id, sample_index=sample_index)
+            sample_kwargs = self._sample_kwargs_with_batch_index(
+                sample_kwargs,
+                batch_id=batch_id,
+                sample_index=sample_index,
+                training_run_id=training_run_id,
+            )
             messages = self._messages_from_raw_prompt(sample_kwargs.get("raw_prompt"))
             prompt_ids = await self._prompt_ids(messages)
             requests.append(
@@ -367,12 +399,21 @@ class UEnvAgentLoop(AgentLoopBase):
             )
         return requests
 
-    def _sample_kwargs_with_batch_index(self, sample_kwargs: dict[str, Any], *, batch_id: str, sample_index: int) -> dict[str, Any]:
+    def _sample_kwargs_with_batch_index(
+        self,
+        sample_kwargs: dict[str, Any],
+        *,
+        batch_id: str,
+        sample_index: int,
+        training_run_id: str,
+    ) -> dict[str, Any]:
         output = dict(sample_kwargs)
         extra_info = self._python_value(output.get("extra_info") or {})
         extra_info = dict(extra_info) if isinstance(extra_info, dict) else {}
         extra_info["batch_id"] = batch_id
         extra_info["sample_index"] = sample_index
+        # 与 run_batch 的 RUN_* 使用同一 training_run_id，避免 Obs 落到不同 run。
+        extra_info["training_run_id"] = training_run_id
         output["extra_info"] = extra_info
         return output
 
@@ -521,6 +562,10 @@ class UEnvAgentLoop(AgentLoopBase):
 
     def _model_version_from_result(self, result: EpisodeResult) -> dict[str, Any]:
         output: dict[str, Any] = {}
+        if result.rollout_param_version is not None:
+            output["rollout_param_version"] = result.rollout_param_version
+        if result.rollout_policy_version:
+            output["rollout_policy_version"] = result.rollout_policy_version
         for step in result.trajectory.steps:
             info = step.info if isinstance(step.info, dict) else {}
             nested = self._json_object_from_info(info.get("uenv_model_version"))
@@ -584,6 +629,7 @@ class UEnvAgentLoop(AgentLoopBase):
         reward_model = sample_kwargs.get("reward_model")
         data_source = self._string_or_none(sample_kwargs.get("data_source"))
         task_name = self._task_name(sample_kwargs, env_type)
+        dataset = self._dataset_name(sample_kwargs, data_source=data_source, task_name=task_name)
         prompt_as_text = prompt_text(raw_prompt)
         model_endpoint = model_endpoint_override or self._model_endpoint(sample_kwargs, sampling_params)
         model_name = model_name_override or self._model_name(sample_kwargs, sampling_params)
@@ -610,7 +656,15 @@ class UEnvAgentLoop(AgentLoopBase):
                 "metadata",
             ],
         }
-        metadata.update(self._parallel_metadata(sample_kwargs))
+        # Obs / 可视化：把样本挂到同一 training_run（缺省用 batch_id）。
+        training_run_id = str(
+            self._value_from_extra_info(sample_kwargs, "training_run_id", None)
+            or os.environ.get("UENV_TRAINING_RUN_ID")
+            or batch_id
+        )
+        metadata["training_run_id"] = training_run_id
+        parallel_mode, parallel_metadata = self._parallel_metadata(sample_kwargs)
+        metadata.update(parallel_metadata)
         generation_config = {
             "temperature": sampling_params.get("temperature"),
             "top_p": sampling_params.get("top_p"),
@@ -627,6 +681,7 @@ class UEnvAgentLoop(AgentLoopBase):
             "env_config": {
                 "task_name": task_name,
                 "data_source": data_source,
+                "dataset": dataset,
                 "raw_prompt": prompt_as_text,
             },
             "model_endpoint": {
@@ -665,6 +720,7 @@ class UEnvAgentLoop(AgentLoopBase):
             resource_spec=ResourceSpec(),
             model_endpoint=model_endpoint,
             seed=seed,
+            parallel_mode=parallel_mode,
         )
 
     def _record_episode_requests(self, requests: list[EpisodeRequest], *, phase: str) -> None:
@@ -786,9 +842,8 @@ class UEnvAgentLoop(AgentLoopBase):
         ids: list[int] = []
         fallback_text = ""
         for step in result.trajectory.steps:
-            step_ids = self._ids_from_info(step.info, "response_ids")
-            if step_ids:
-                ids.extend(step_ids)
+            if step.response_ids:
+                ids.extend(int(item) for item in step.response_ids)
                 continue
             text = step.info.get("response_text") or step.action.decode("utf-8", errors="replace")
             if text:
@@ -798,9 +853,8 @@ class UEnvAgentLoop(AgentLoopBase):
         if fallback_text:
             return self._encode_response_text(fallback_text)
         for step in reversed(result.trajectory.steps):
-            ids = self._ids_from_info(step.info, "response_ids")
-            if ids:
-                return ids
+            if step.response_ids:
+                return [int(item) for item in step.response_ids]
             text = step.info.get("response_text") or step.action.decode("utf-8", errors="replace")
             ids = self._encode_response_text(text)
             if ids:
@@ -810,30 +864,11 @@ class UEnvAgentLoop(AgentLoopBase):
     def _response_mask_from_result(self, result: EpisodeResult, fallback_len: int) -> list[int]:
         masks: list[int] = []
         for step in result.trajectory.steps:
-            step_mask = self._ids_from_info(step.info, "response_mask")
-            if step_mask:
-                masks.extend(1 if item else 0 for item in step_mask)
+            if step.response_mask:
+                masks.extend(1 if item else 0 for item in step.response_mask)
         if masks:
             return masks
         return [1] * fallback_len
-
-    def _ids_from_info(self, info: dict[str, str], key: str) -> list[int]:
-        raw = info.get(key)
-        if raw is None:
-            return []
-        try:
-            value = json.loads(raw)
-        except Exception:
-            value = raw
-        if not isinstance(value, list):
-            return []
-        ids = []
-        for item in value:
-            try:
-                ids.append(int(item))
-            except Exception:
-                return []
-        return ids
 
     def _encode_response_text(self, text: str) -> list[int]:
         if self.tokenizer is None:
@@ -863,7 +898,16 @@ class UEnvAgentLoop(AgentLoopBase):
             sample_kwargs.get("data_source"),
         ]
         lowered = " ".join(str(self._python_value(item) or "").lower() for item in candidates)
-        if "gsm8k" in lowered or "math" in lowered:
+        if any(
+            token in lowered
+            for token in (
+                "gsm8k",
+                "math",
+                "pubmedqa",
+                "scitab",
+                "olymmath",
+            )
+        ):
             return "math"
         if "humaneval" in lowered or "mbpp" in lowered or "code" in lowered:
             return "code"
@@ -877,6 +921,31 @@ class UEnvAgentLoop(AgentLoopBase):
             if value:
                 return value
         return env_type
+
+    def _dataset_name(self, sample_kwargs: dict[str, Any], *, data_source: str | None, task_name: str) -> str:
+        explicit = (
+            self._value_from_extra_info(sample_kwargs, "dataset", None)
+            or self._value_from_extra_info(sample_kwargs, "benchmark", None)
+            or data_source
+            or task_name
+        )
+        value = str(self._python_value(explicit) or "").strip()
+        lowered = value.lower()
+        if "pubmedqa" in lowered:
+            return "pubmedqa"
+        if "scitab" in lowered:
+            return "scitab"
+        if "dscodebench" in lowered or "ds-bench" in lowered or "dsbench" in lowered:
+            return "dscodebench"
+        if "olymmath" in lowered:
+            if "hard" in lowered:
+                return "olymmath-hard"
+            if "easy" in lowered:
+                return "olymmath-easy"
+            return "olymmath"
+        if "gsm8k" in lowered:
+            return "gsm8k"
+        return value
 
     def _model_endpoint(self, sample_kwargs: dict[str, Any], sampling_params: dict[str, Any]) -> str:
         endpoint = (
@@ -894,18 +963,18 @@ class UEnvAgentLoop(AgentLoopBase):
         )
         return str(model_name)
 
-    def _parallel_metadata(self, sample_kwargs: dict[str, Any]) -> dict[str, Any]:
+    def _parallel_metadata(self, sample_kwargs: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         mode = str(
             self._value_from_extra_info(sample_kwargs, "parallel_mode", self.config_for_uenv.parallel_mode) or "sync"
         )
-        output: dict[str, Any] = {"parallel_mode": mode}
+        output: dict[str, Any] = {}
         global_step = self._value_from_extra_info(sample_kwargs, "global_step", None)
         if global_step is None:
             global_step = self._value_from_extra_info(sample_kwargs, "global_steps", None)
         if global_step is not None:
             output["global_step"] = self._jsonable(global_step)
         if mode != "one_step_off_policy":
-            return output
+            return mode, {"verl": output} if output else {}
 
         generation_step = self._value_from_extra_info(sample_kwargs, "generation_step", global_step)
         target_train_step = self._value_from_extra_info(
@@ -927,15 +996,12 @@ class UEnvAgentLoop(AgentLoopBase):
                 "rollout_step": self._jsonable(rollout_step),
                 "consume_step": self._jsonable(consume_step),
                 "policy_version": self._jsonable(policy_version),
-                "rollout_policy_version": self._jsonable(
-                    self._value_from_extra_info(sample_kwargs, "rollout_policy_version", policy_version)
-                ),
                 "parameter_sync_id": self._jsonable(
                     self._value_from_extra_info(sample_kwargs, "parameter_sync_id", self._sync_id_from_step(generation_step))
                 ),
             }
         )
-        return output
+        return mode, {"verl": output}
 
     def _step_plus_one(self, value: Any) -> Any:
         try:

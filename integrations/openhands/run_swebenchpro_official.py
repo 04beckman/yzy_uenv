@@ -35,6 +35,7 @@ sys.path.insert(0, str(_INTEGRATION))
 from uenv_runtime.client import UEnvGatewayClient, GatewayError  # noqa: E402
 from uenv_runtime.agent_job import load_agent_job  # noqa: E402
 from uenv_runtime.gateway_tools import patch_openhands_tools_for_uenv  # noqa: E402
+from uenv_runtime.llm_rollout import RolloutTraceCollector  # noqa: E402
 from uenv_runtime.workspace import UEnvWorkspace  # noqa: E402
 
 
@@ -55,14 +56,63 @@ def _pro_workspace_dir(variant: str) -> str:
     return "/app" if variant.lower() == "pro" else "/testbed"
 
 
+def _infer_repo_language(instance: dict[str, Any]) -> str:
+    lang = str(instance.get("repo_language") or "").strip().lower()
+    if lang:
+        return lang
+    repo = str(instance.get("repo") or "").lower()
+    if repo.endswith("/go") or ".go" in repo:
+        return "go"
+    # Common Pro repos when catalog omits repo_language.
+    go_repos = (
+        "flipt-io/flipt",
+        "gravitational/teleport",
+        "navidrome/navidrome",
+        "future-architect/vuls",
+    )
+    js_repos = (
+        "element-hq/element-web",
+        "nodebb/nodebb",
+        "protonmail/webclients",
+        "internetarchive/openlibrary",
+    )
+    if any(repo == r or repo.endswith(r) for r in go_repos):
+        return "go"
+    if any(repo == r or repo.endswith(r) for r in js_repos):
+        return "javascript"
+    if "tutao" in repo:
+        return "typescript"
+    if "ansible" in repo or "qutebrowser" in repo:
+        return "python"
+    return ""
+
+
 def _build_instruction(instance: dict[str, Any], repo_path: str) -> str:
     ps = instance.get("problem_statement") or instance.get("issue_text") or ""
+    repo_language = _infer_repo_language(instance)
+    if repo_language in {"python", "py"}:
+        language_hint = "Python files such as `*.py`"
+    elif repo_language in {"go", "golang"}:
+        language_hint = "Go files such as `*.go`"
+    elif repo_language in {"javascript", "js", "typescript", "ts"}:
+        language_hint = "JavaScript/TypeScript files such as `*.js`, `*.ts`, and `*.tsx`"
+    else:
+        language_hint = "files matching the repository language and nearby config/template files"
     return (
         f"The git repository is already checked out at `{repo_path}`.\n"
-        f"Start by running `ls -la {repo_path}` and `find {repo_path} -maxdepth 2 -type f -name '*.py' | head`.\n"
-        f"All edits must be under `{repo_path}`.\n\n"
+        f"All investigation and edits must stay under `{repo_path}`.\n"
+        "Start by confirming the workspace:\n"
+        f"1. `pwd`\n"
+        f"2. `git -C {repo_path} rev-parse --show-toplevel`\n"
+        f"3. `ls -la {repo_path}`\n\n"
+        "Inspect the repository structure and identify the relevant language/framework before searching.\n"
+        f"This instance is labeled as `{repo_language or 'unknown'}`; prioritize {language_hint}.\n"
+        "Use targeted searches with `rg` for symbols, error messages, routes, tests, or issue keywords.\n"
+        "When relevant, also inspect non-test project files such as JSON, YAML, templates, and generated schemas.\n"
+        f"Do not search or edit outside `{repo_path}`. Do not inspect `/opt/openhands`, benchmark harness directories, `/tmp`, or `/root` unless explicitly required by a tool.\n\n"
         f"<issue_description>\n{ps}\n</issue_description>\n\n"
-        "Implement the minimal fix to non-test source files. Tests are already updated.\n"
+        "Implement the minimal fix in non-test project files required by the issue. Tests are already provided by the benchmark; do not modify tests unless the issue explicitly requires it.\n"
+        "Before finishing, inspect `git diff` and make sure the patch is focused.\n"
         "Use terminal and file_editor tools. When done, call the finish tool.\n"
     )
 
@@ -300,11 +350,15 @@ def main() -> int:
         client = UEnvGatewayClient("http://127.0.0.1:1", api_key=args.api_key, run_id=run_id)
 
     llm = None
+    rollout_collector = None
+    rollout_fields: dict[str, Any] = {}
     if args.mode == "llm":
         if not args.llm_config:
             print("--llm-config required for llm mode", file=sys.stderr)
             return 1
         llm = load_llm_config(args.llm_config)
+        rollout_collector = RolloutTraceCollector(args.llm_config)
+        rollout_collector.install(llm)
         logger.info("LLM model=%s", llm.model)
 
     session_id = agent_job.session_id if agent_job else None
@@ -372,6 +426,10 @@ def main() -> int:
                     out / "conversation_events.json",
                     {"count": len(list(conversation.state.events))},
                 )
+                if rollout_collector is None:
+                    raise RuntimeError("LLM rollout collector was not initialized")
+                rollout_fields = rollout_collector.finalize()
+                _save_json(out / "llm_rollout_trace.json", rollout_fields)
                 result = ws.submit()
 
         elapsed = time.time() - t0
@@ -385,6 +443,7 @@ def main() -> int:
             "trajectory_ref": result.trajectory_ref,
             "elapsed_sec": elapsed,
         }
+        submit_doc.update(rollout_fields)
         _save_json(out / "submit_result.json", submit_doc)
 
         ref = result.trajectory_ref

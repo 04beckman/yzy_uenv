@@ -23,7 +23,7 @@ Common environment overrides:
   VERL_WORKSPACE                Host VeRL workspace. Default: /data/podman/verl/workspace
   MODEL_PATH                    Host policy model path. Default: /data/ronghao/models/modelscope/Qwen/Qwen2___5-0___5B-Instruct
   HOST_MODEL_PATH               Host policy model path; preferred when MODEL_PATH is used as an old container-path alias.
-  DATA_DIR                      Host generated VeRL-format GSM8K dir. Default: <repo>/data/
+  DATA_DIR                      Host generated VeRL-format GSM8K dir. Default: <repo>/data/gsm8k
   CONTAINER_MODEL_PATH          Container policy model path. Default: /models/modelscope/Qwen/Qwen2___5-0___5B-Instruct
   CONTAINER_DATA_DIR            Container generated VeRL-format GSM8K dir. Default: /uenv/uenv-bridge/tmp/verl_layer4_agent_loop_data
   INFER_BACKEND                 VeRL rollout backend. Default: vllm
@@ -42,6 +42,8 @@ Common environment overrides:
   UENV_MODEL_GATEWAY_ENABLED    Start adapter-side model gateway and send its URL to Worker. Default: 0
   UENV_MODEL_GATEWAY_PORT       Adapter-side model gateway port. Default: 18080
   UENV_MODEL_GATEWAY_PUBLIC_URL Worker-visible gateway URL. Default: http://10.10.20.142:<port>/v1
+  UENV_MODEL_GATEWAY_DISABLE_THINKING
+                                  Inject chat_template_kwargs.enable_thinking=false for OpenAI chat requests. Default: 0
   RAY_NUM_CPUS                  Default: NGPUS_PER_NODE * 4
   SERVER_ADAPTER_CORE_ENDPOINT  Server-side Rust adapter core gRPC endpoint. Default: 8.130.75.157:8088
   LOG_ROOT                      Host directory for run logs. Default: <repo>/temp/logs
@@ -130,7 +132,7 @@ MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-512}
 ROLLOUT_N=${ROLLOUT_N:-5}
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 DATA_MAX_RESPONSE_LENGTH=${DATA_MAX_RESPONSE_LENGTH:-1024}
-DATA_DIR=${DATA_DIR:-/data/ronghao/uenv/uenv-bridge/data}
+DATA_DIR=${DATA_DIR:-/data/ronghao/uenv/uenv-bridge/data/gsm8k}
 CONTAINER_DATA_DIR=${CONTAINER_DATA_DIR:-/data/gsm8k}
 INFER_BACKEND=${INFER_BACKEND:-vllm}
 
@@ -159,6 +161,7 @@ UENV_MODEL_GATEWAY_ENABLED=${UENV_MODEL_GATEWAY_ENABLED:-0}
 UENV_MODEL_GATEWAY_BIND_HOST=${UENV_MODEL_GATEWAY_BIND_HOST:-0.0.0.0}
 UENV_MODEL_GATEWAY_PORT=${UENV_MODEL_GATEWAY_PORT:-18080}
 UENV_MODEL_GATEWAY_PUBLIC_URL=${UENV_MODEL_GATEWAY_PUBLIC_URL:-http://10.10.20.142:${UENV_MODEL_GATEWAY_PORT}/v1}
+UENV_MODEL_GATEWAY_DISABLE_THINKING=${UENV_MODEL_GATEWAY_DISABLE_THINKING:-0}
 ACTOR_LR=${ACTOR_LR:-1e-6}
 KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
@@ -230,6 +233,7 @@ export UENV_MODEL_GATEWAY_BIND_HOST=${UENV_MODEL_GATEWAY_BIND_HOST}
 export UENV_MODEL_GATEWAY_PORT=${UENV_MODEL_GATEWAY_PORT}
 export UENV_MODEL_GATEWAY_PUBLIC_URL=${UENV_MODEL_GATEWAY_PUBLIC_URL}
 export UENV_MODEL_GATEWAY_LOG_PATH=\"${MODEL_GATEWAY_LOG_PATH}\"
+export UENV_MODEL_GATEWAY_DISABLE_THINKING=${UENV_MODEL_GATEWAY_DISABLE_THINKING}
 pip install -q 'grpcio>=1.80' --break-system-packages 2>/dev/null || pip install -q 'grpcio>=1.80'
 export UENV_AGENT_LOOP_CLIENT=rust_core
 export UENV_ADAPTER_CORE_ENDPOINT=${SERVER_ADAPTER_CORE_ENDPOINT}

@@ -18,7 +18,7 @@ Common overrides:
   IMAGE                         Default: localhost/uenv-bridge-verl:layer4-build
   VERL_WORKSPACE                Default: /data/podman/verl/workspace
   MODEL_PATH                    Default: /data/ronghao/models/modelscope/Qwen/Qwen2___5-0___5B-Instruct
-  DATA_DIR                      Default: <repo>/data
+  DATA_DIR                      Default: <repo>/data/gsm8k
   TRAINING_STEPS                Default: 1
   PPO_MINI_BATCH_SIZE           Default: 4
   PPO_MICRO_BATCH_SIZE_PER_GPU  Default: 1
@@ -102,7 +102,7 @@ DEFAULT_CONTAINER_MODEL_PATH=/models/modelscope/Qwen/Qwen2___5-0___5B-Instruct
 MODEL_PATH=${MODEL_PATH:-${DEFAULT_HOST_MODEL_PATH}}
 CONTAINER_MODEL_PATH=${CONTAINER_MODEL_PATH:-${DEFAULT_CONTAINER_MODEL_PATH}}
 
-DATA_DIR=${DATA_DIR:-${REPO_DIR}/data}
+DATA_DIR=${DATA_DIR:-${REPO_DIR}/data/gsm8k}
 CONTAINER_DATA_DIR=${CONTAINER_DATA_DIR:-/data/gsm8k}
 
 TRAINING_STEPS=${TRAINING_STEPS:-1}
@@ -189,6 +189,7 @@ UENV_MODEL_GATEWAY_ENABLED=${UENV_MODEL_GATEWAY_ENABLED:-0}
 UENV_MODEL_GATEWAY_BIND_HOST=${UENV_MODEL_GATEWAY_BIND_HOST:-0.0.0.0}
 UENV_MODEL_GATEWAY_PORT=${UENV_MODEL_GATEWAY_PORT:-18080}
 UENV_MODEL_GATEWAY_PUBLIC_URL=${UENV_MODEL_GATEWAY_PUBLIC_URL:-http://10.10.20.142:${UENV_MODEL_GATEWAY_PORT}/v1}
+UENV_MODEL_GATEWAY_DISABLE_THINKING=${UENV_MODEL_GATEWAY_DISABLE_THINKING:-0}
 EXTRA_VERL_ARGS=${EXTRA_VERL_ARGS:-}
 
 mkdir -p "${LOG_DIR}" "${SERVICE_DIR}"
@@ -307,6 +308,7 @@ export UENV_MODEL_GATEWAY_BIND_HOST=${UENV_MODEL_GATEWAY_BIND_HOST}
 export UENV_MODEL_GATEWAY_PORT=${UENV_MODEL_GATEWAY_PORT}
 export UENV_MODEL_GATEWAY_PUBLIC_URL=${UENV_MODEL_GATEWAY_PUBLIC_URL}
 export UENV_MODEL_GATEWAY_LOG_PATH=\"${MODEL_GATEWAY_LOG_PATH}\"
+export UENV_MODEL_GATEWAY_DISABLE_THINKING=${UENV_MODEL_GATEWAY_DISABLE_THINKING}
 python3 -m verl.experimental.fully_async_policy.fully_async_main \\
   hydra.run.dir=${CONTAINER_LOG_ROOT}/verl_fully_async_uenv/hydra_${RUN_ID} \\
   algorithm.adv_estimator=grpo \\

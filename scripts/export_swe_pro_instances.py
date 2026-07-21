@@ -77,6 +77,7 @@ def row_to_instance(r: dict) -> dict:
     row = {
         "instance_id": r["instance_id"],
         "repo": r.get("repo", ""),
+        "repo_language": lang or None,
         "version": "pro",
         "base_commit": r.get("base_commit", ""),
         "benchmark_variant": "pro",
@@ -99,7 +100,12 @@ def main() -> int:
     ap.add_argument("--out", default="config/swe/pro.json")
     ap.add_argument("--ids", default="", help="comma-separated instance_id whitelist")
     ap.add_argument("--repo-language", default="", help="filter e.g. Python|Go|JavaScript")
-    ap.add_argument("--limit", type=int, default=1, help="max instances (default 1 for smoke)")
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=1,
+        help="max instances (default 1 for smoke; 0 = no limit / full export)",
+    )
     args = ap.parse_args()
 
     try:

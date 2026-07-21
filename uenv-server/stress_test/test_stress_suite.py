@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
+import unittest
+
+import run_stress_suite
+import stress_test_common
+
+
+class StressSuiteTests(unittest.TestCase):
+    def test_scale_config_requires_1024_simulator_and_10_waves(self):
+        config = run_stress_suite.load_suite_config(
+            Path(__file__).with_name("stress_suite.json")
+        )
+        self.assertEqual(config["gate3"]["model_mode"], "simulator")
+        self.assertEqual(config["gate3"]["workers"], 1024)
+        self.assertEqual(
+            config["gate3"]["episode_batch_size"] * config["gate3"]["exact_batches_per_mode"],
+            config["gate3"]["workers"] * config["gate3"]["capacity_per_worker"] * config["gate3"]["min_episode_waves"],
+        )
+        self.assertEqual(config["gate3"]["simulator_wrong_steps"]["mean"], 2.0)
+        self.assertEqual(config["gate3"]["simulator_wrong_steps"]["std"], 1.0)
+        self.assertEqual(config["gate3"]["code_python"], "/opt/uenv-stress/venvs/dscodebench/bin/python")
+        self.assertEqual(config["gate4"]["mode"], "llm")
+        self.assertEqual(config["gate4"]["llm_kind"], "simulator")
+        self.assertGreaterEqual(config["gate4"]["instance_count"], 2)
+        self.assertFalse(config["worker_scale"]["enabled"])
+        self.assertEqual(config["worker_scale"]["tiers"], [1024])
+        self.assertEqual(config["worker_scale"]["model_port"], 6379)
+        self.assertEqual(config["worker_scale"]["episode_batch_size"], 256)
+        self.assertEqual(config["worker_scale"]["episodes_per_worker"], 10)
+        self.assertEqual(config["worker_scale"]["simulator_latency_ms"]["mean"], 500.0)
+        self.assertEqual(config["worker_scale"]["plugin_ready_timeout_seconds"], 30)
+        self.assertEqual(config["worker_scale"]["worker_register_max_attempts"], 20)
+        self.assertEqual(config["worker_scale"]["worker_register_retry_backoff_ms"], 100)
+        self.assertEqual(config["worker_scale"]["code_python"], "/opt/uenv-stress/venvs/dscodebench/bin/python")
+
+    def test_real_dscodebench_row_maps_to_worker_contract(self):
+        row = {
+            "problem_id": "numpy_0",
+            "library": "numpy",
+            "code_problem": "Implement solve(values).",
+            "ground_truth_code": "def solve(values):\n    return values",
+            "test_script": "def generate_test_cases(num_tests):\n    return [([1],)]",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dataset.jsonl"
+            path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            loaded = stress_test_common.load_dscodebench_jsonl(str(path), limit=1)
+        payload = stress_test_common.dscodebench_env_payload(
+            loaded[0],
+            task_id="gate3-real-1",
+            min_steps_before_terminate=3,
+        )
+        self.assertEqual(payload["dataset"], "dscodebench")
+        self.assertEqual(payload["library"], "numpy")
+        self.assertEqual(payload["min_steps_before_terminate"], 3)
+        self.assertIn("Dataset Problem ID: numpy_0", payload["question"])
+        self.assertNotIn(row["ground_truth_code"], payload["question"])
+        self.assertIn("dscodebench_harness", payload["test_code"])
+
+    def test_scale_resource_gate_projects_next_tier(self):
+        scenario = {
+            "result": {
+                "fleet_resource_metrics": {
+                    "mem_total_bytes": 16 * 1024**3,
+                    "initial_mem_available_bytes": 12 * 1024**3,
+                    "min_mem_available_bytes": 12 * 1024**3 - 256 * 1024**2,
+                    "peak_rss_bytes": 256 * 1024**2,
+                    "peak_processes": 65,
+                    "peak_open_fds": 512,
+                    "sample_count": 2,
+                }
+            }
+        }
+        decision = run_stress_suite.scale_resource_gate(
+            scenario,
+            current_workers=32,
+            next_workers=512,
+            config={
+                "minimum_mem_available_bytes": 2 * 1024**3,
+                "maximum_projected_host_memory_fraction": 0.85,
+            },
+        )
+        self.assertTrue(decision["passed"])
+        self.assertEqual(decision["projected_next_fleet_memory_bytes"], 4 * 1024**3)
+
+    def test_exact_batch_loop_rechecks_after_semaphore_wait(self):
+        source = Path(__file__).with_name("run_distributed_gate3_code.py").read_text(encoding="utf-8")
+        self.assertIn(
+            "if args.exact_batches > 0 and batch_sequence >= args.exact_batches",
+            source,
+        )
+
+    def test_gate3_scale_command_receives_private_range_and_distribution(self):
+        config = run_stress_suite.load_suite_config(
+            Path(__file__).with_name("stress_suite.json")
+        )
+        args = SimpleNamespace(
+            source_repo="/repo", server_bin="/server", worker_bin="/worker",
+            code_plugin_bin="/plugin", protected_pid=1, protected_port=[8077, 8088],
+            server_host="server", worker_host="worker", server_private_ip="10.0.0.1",
+            worker_private_ip="10.0.0.2", server_port=8099, worker_port=8000,
+            model_port=8888, obs_port=18002, llm_config="/secret/config.json",
+            private_worker_port_range="8000-9023",
+        )
+        command = run_stress_suite.gate3_command(args, config, Path("/artifacts"))
+        self.assertIn("--private-worker-port-range", command)
+        self.assertIn("--simulator-wrong-steps-mean", command)
+        self.assertIn("--min-scale-episode-waves", command)
+        self.assertIn("--code-python", command)
+        exact_batches_index = command.index("--exact-batches")
+        self.assertEqual(command[exact_batches_index + 1], "40")
+        scale_command = run_stress_suite.worker_scale_command(
+            args, config, 1024, Path("/scale-artifacts")
+        )
+        model_port_index = scale_command.index("--model-port")
+        self.assertEqual(scale_command[model_port_index + 1], "6379")
+        batch_size_index = scale_command.index("--episode-batch-size")
+        self.assertEqual(scale_command[batch_size_index + 1], "256")
+        exact_batches_index = scale_command.index("--exact-batches")
+        self.assertEqual(scale_command[exact_batches_index + 1], "40")
+        concurrent_batches_index = scale_command.index("--concurrent-batches")
+        self.assertEqual(scale_command[concurrent_batches_index + 1], "4")
+        self.assertIn("--code-python", scale_command)
+
+    def test_newest_summary_finds_child_output_under_absolute_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            target = root / "nested" / "gate3-summary-test.json"
+            target.parent.mkdir()
+            target.write_text("{}", encoding="utf-8")
+            self.assertEqual(
+                run_stress_suite.newest_summary(root, "gate3-summary-*.json"),
+                target,
+            )
+
+    def test_validate_arguments_rejects_model_port_inside_worker_range(self):
+        config = run_stress_suite.load_suite_config(
+            Path(__file__).with_name("stress_suite.json")
+        )
+        args = SimpleNamespace(
+            source_repo="/repo", server_bin="/server", worker_bin="/worker",
+            code_plugin_bin="/plugin", protected_pid=1, protected_port=[8077, 8088],
+            server_host="server", worker_host="worker", server_private_ip="10.0.0.1",
+            worker_private_ip="10.0.0.2", server_port=8099, worker_port=8000,
+            model_port=8888, gateway_port=8777, agent_api_port=18004,
+            agent_health_port=18005, obs_port=18002, llm_config="",
+            private_worker_port_range="8000-9023",
+        )
+        with self.assertRaisesRegex(ValueError, "model port 8888 overlaps"):
+            run_stress_suite.validate_arguments(args, config)
+
+
+if __name__ == "__main__":
+    unittest.main()
